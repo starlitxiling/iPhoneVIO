@@ -21,6 +21,23 @@ class ViewController: UIViewController, ARSessionDelegate, ObservableObject {
     var prevTimestamp: Double = 0.0
     private var depthStreamingEnabled: Bool = false
     private var usingSmoothedDepth: Bool = false
+    // UMI-FT style depth preprocessing:
+    // - emphasize near-surface geometry by clipping depth
+    // - optional downsampling for lower streaming bandwidth
+    private let depthClipMaxMeters: Float = 0.5
+    private let depthDownsampleFactor: Int = 2
+    private let minConfidenceLevel: UInt8 = 1
+    private let enableDepthCompression: Bool = true
+
+    private struct DepthPayload {
+        let depthBytes: Data
+        let confidenceBytes: Data
+        let width: UInt32
+        let height: UInt32
+        let isClipped: Bool
+        let isDownsampled: Bool
+        let isConfidenceFiltered: Bool
+    }
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -110,22 +127,15 @@ class ViewController: UIViewController, ARSessionDelegate, ObservableObject {
         }
 
         let depthMap = depthData.depthMap
-        guard let depthBytes = pixelBufferToContiguousBytes(depthMap, bytesPerPixel: MemoryLayout<Float32>.size) else {
+        let confidenceMap = depthData.confidenceMap
+        guard let payload = preprocessDepth(depthMap: depthMap, confidenceMap: confidenceMap) else {
             return nil
-        }
-
-        var confidenceBytes = Data()
-        if let confidenceMap = depthData.confidenceMap,
-           let encodedConfidence = pixelBufferToContiguousBytes(confidenceMap, bytesPerPixel: MemoryLayout<UInt8>.size) {
-            confidenceBytes = encodedConfidence
         }
 
         let cameraResolution = frame.camera.imageResolution
         let cameraWidth = UInt32(max(0, Int(cameraResolution.width.rounded())))
         let cameraHeight = UInt32(max(0, Int(cameraResolution.height.rounded())))
 
-        let depthWidth = UInt32(CVPixelBufferGetWidth(depthMap))
-        let depthHeight = UInt32(CVPixelBufferGetHeight(depthMap))
         var depthTimestamp = frame.capturedDepthDataTimestamp
         if depthTimestamp <= 0 {
             depthTimestamp = poseTimestamp
@@ -138,52 +148,115 @@ class ViewController: UIViewController, ARSessionDelegate, ObservableObject {
             intrinsics: frame.camera.intrinsics,
             cameraWidth: cameraWidth,
             cameraHeight: cameraHeight,
-            depthWidth: depthWidth,
-            depthHeight: depthHeight,
-            depthBytes: depthBytes,
-            confidenceBytes: confidenceBytes,
-            isSmoothedDepth: usingSmoothedDepth
+            depthWidth: payload.width,
+            depthHeight: payload.height,
+            depthBytes: payload.depthBytes,
+            confidenceBytes: payload.confidenceBytes,
+            isSmoothedDepth: usingSmoothedDepth,
+            depthClipMaxMeters: depthClipMaxMeters,
+            depthDownsampleFactor: UInt8(max(1, min(255, depthDownsampleFactor))),
+            minConfidenceLevel: minConfidenceLevel,
+            isDepthClipped: payload.isClipped,
+            isDepthDownsampled: payload.isDownsampled,
+            isConfidenceFiltered: payload.isConfidenceFiltered,
+            enableZlibCompression: enableDepthCompression
         )
     }
 
-    private func pixelBufferToContiguousBytes(_ pixelBuffer: CVPixelBuffer, bytesPerPixel: Int) -> Data? {
-        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+    private func preprocessDepth(depthMap: CVPixelBuffer, confidenceMap: CVPixelBuffer?) -> DepthPayload? {
+        CVPixelBufferLockBaseAddress(depthMap, .readOnly)
         defer {
-            CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
+            CVPixelBufferUnlockBaseAddress(depthMap, .readOnly)
+        }
+        if let confidenceMap {
+            CVPixelBufferLockBaseAddress(confidenceMap, .readOnly)
+        }
+        defer {
+            if let confidenceMap {
+                CVPixelBufferUnlockBaseAddress(confidenceMap, .readOnly)
+            }
         }
 
-        let planeCount = CVPixelBufferGetPlaneCount(pixelBuffer)
-        let width: Int
-        let height: Int
-        let bytesPerRow: Int
-        let baseAddress: UnsafeMutableRawPointer?
-
-        if planeCount > 0 {
-            width = CVPixelBufferGetWidthOfPlane(pixelBuffer, 0)
-            height = CVPixelBufferGetHeightOfPlane(pixelBuffer, 0)
-            bytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
-            baseAddress = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0)
-        } else {
-            width = CVPixelBufferGetWidth(pixelBuffer)
-            height = CVPixelBufferGetHeight(pixelBuffer)
-            bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
-            baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer)
-        }
-
-        guard let baseAddress else {
+        let width = CVPixelBufferGetWidth(depthMap)
+        let height = CVPixelBufferGetHeight(depthMap)
+        guard width > 0, height > 0 else {
             return nil
         }
-        let rowBytes = width * bytesPerPixel
-        guard rowBytes > 0, bytesPerRow >= rowBytes, height > 0 else {
+        let depthBytesPerRow = CVPixelBufferGetBytesPerRow(depthMap)
+        guard let depthBaseAddress = CVPixelBufferGetBaseAddress(depthMap) else {
             return nil
         }
 
-        var output = Data(capacity: rowBytes * height)
-        for row in 0..<height {
-            let rowPointer = baseAddress.advanced(by: row * bytesPerRow).assumingMemoryBound(to: UInt8.self)
-            output.append(rowPointer, count: rowBytes)
+        var confidenceBaseAddress: UnsafeMutableRawPointer?
+        var confidenceBytesPerRow = 0
+        if let confidenceMap {
+            confidenceBaseAddress = CVPixelBufferGetBaseAddress(confidenceMap)
+            confidenceBytesPerRow = CVPixelBufferGetBytesPerRow(confidenceMap)
         }
-        return output
+
+        let step = max(1, depthDownsampleFactor)
+        let outputWidth = (width + step - 1) / step
+        let outputHeight = (height + step - 1) / step
+        let outputCount = outputWidth * outputHeight
+        var depthOutput = Data(capacity: outputCount * MemoryLayout<Float32>.size)
+        var confidenceOutput = Data(capacity: outputCount)
+
+        let doClip = depthClipMaxMeters > 0
+        let doConfidenceFilter = confidenceBaseAddress != nil
+        var clippedAny = false
+
+        for y in stride(from: 0, to: height, by: step) {
+            let depthRow = depthBaseAddress
+                .advanced(by: y * depthBytesPerRow)
+                .assumingMemoryBound(to: Float32.self)
+            let confidenceRow: UnsafeMutablePointer<UInt8>? = {
+                guard let confidenceBaseAddress else {
+                    return nil
+                }
+                return confidenceBaseAddress
+                    .advanced(by: y * confidenceBytesPerRow)
+                    .assumingMemoryBound(to: UInt8.self)
+            }()
+
+            for x in stride(from: 0, to: width, by: step) {
+                var depthValue = depthRow[x]
+                var confidenceValue: UInt8 = 0
+
+                if let confidenceRow {
+                    confidenceValue = confidenceRow[x]
+                }
+
+                if !depthValue.isFinite || depthValue <= 0 {
+                    depthValue = 0
+                } else {
+                    if doConfidenceFilter && confidenceValue < minConfidenceLevel {
+                        depthValue = 0
+                    } else if doClip && depthValue > depthClipMaxMeters {
+                        depthValue = depthClipMaxMeters
+                        clippedAny = true
+                    }
+                }
+
+                var depthRaw = depthValue
+                Swift.withUnsafeBytes(of: &depthRaw) { bytes in
+                    depthOutput.append(bytes.bindMemory(to: UInt8.self))
+                }
+
+                if doConfidenceFilter {
+                    confidenceOutput.append(confidenceValue)
+                }
+            }
+        }
+
+        return DepthPayload(
+            depthBytes: depthOutput,
+            confidenceBytes: doConfidenceFilter ? confidenceOutput : Data(),
+            width: UInt32(outputWidth),
+            height: UInt32(outputHeight),
+            isClipped: clippedAny,
+            isDownsampled: step > 1,
+            isConfidenceFiltered: doConfidenceFilter && minConfidenceLevel > 0
+        )
     }
     
     override func viewWillDisappear(_ animated: Bool) {

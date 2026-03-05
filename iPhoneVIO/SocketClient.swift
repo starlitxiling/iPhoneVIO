@@ -1,3 +1,4 @@
+import Foundation
 import SocketIO
 import simd
 
@@ -68,8 +69,18 @@ class DataPacket {
 
 class DataPacketV2 {
     static let magicBytes = [UInt8]("IPV2".utf8)
-    static let depthFormatFloat32: UInt8 = 1
-    static let confidenceFormatU8: UInt8 = 1
+    static let depthFormatFloat32Raw: UInt8 = 1
+    static let depthFormatFloat32Zlib: UInt8 = 2
+    static let confidenceFormatU8Raw: UInt8 = 1
+    static let confidenceFormatU8Zlib: UInt8 = 2
+
+    static let flagHasDepth: UInt8 = 1 << 0
+    static let flagHasConfidence: UInt8 = 1 << 1
+    static let flagSmoothedDepth: UInt8 = 1 << 2
+    static let flagCompressed: UInt8 = 1 << 3
+    static let flagDepthClipped: UInt8 = 1 << 4
+    static let flagDepthDownsampled: UInt8 = 1 << 5
+    static let flagConfidenceFiltered: UInt8 = 1 << 6
 
     var transformMatrix: simd_float4x4
     var poseTimestamp: Double
@@ -82,6 +93,13 @@ class DataPacketV2 {
     var depthBytes: Data
     var confidenceBytes: Data
     var isSmoothedDepth: Bool
+    var depthClipMaxMeters: Float
+    var depthDownsampleFactor: UInt8
+    var minConfidenceLevel: UInt8
+    var isDepthClipped: Bool
+    var isDepthDownsampled: Bool
+    var isConfidenceFiltered: Bool
+    var enableZlibCompression: Bool
 
     init(
         transformMatrix: simd_float4x4,
@@ -94,7 +112,14 @@ class DataPacketV2 {
         depthHeight: UInt32,
         depthBytes: Data,
         confidenceBytes: Data,
-        isSmoothedDepth: Bool
+        isSmoothedDepth: Bool,
+        depthClipMaxMeters: Float,
+        depthDownsampleFactor: UInt8,
+        minConfidenceLevel: UInt8,
+        isDepthClipped: Bool,
+        isDepthDownsampled: Bool,
+        isConfidenceFiltered: Bool,
+        enableZlibCompression: Bool
     ) {
         self.transformMatrix = transformMatrix
         self.poseTimestamp = poseTimestamp
@@ -107,22 +132,74 @@ class DataPacketV2 {
         self.depthBytes = depthBytes
         self.confidenceBytes = confidenceBytes
         self.isSmoothedDepth = isSmoothedDepth
+        self.depthClipMaxMeters = depthClipMaxMeters
+        self.depthDownsampleFactor = depthDownsampleFactor
+        self.minConfidenceLevel = minConfidenceLevel
+        self.isDepthClipped = isDepthClipped
+        self.isDepthDownsampled = isDepthDownsampled
+        self.isConfidenceFiltered = isConfidenceFiltered
+        self.enableZlibCompression = enableZlibCompression
+    }
+
+    private func compressZlib(_ bytes: Data) -> Data? {
+        guard !bytes.isEmpty else {
+            return bytes
+        }
+        do {
+            let compressed = try (bytes as NSData).compressed(using: .zlib) as Data
+            return compressed.count < bytes.count ? compressed : nil
+        } catch {
+            print("Depth packet zlib compression failed: \(error)")
+            return nil
+        }
     }
 
     func toBytes() -> Data {
+        var depthPayload = depthBytes
+        var confidencePayload = confidenceBytes
+        var depthFormat: UInt8 = DataPacketV2.depthFormatFloat32Raw
+        var confidenceFormat: UInt8 = confidencePayload.isEmpty ? 0 : DataPacketV2.confidenceFormatU8Raw
+        var isCompressed = false
+
+        if enableZlibCompression {
+            if let compressedDepth = compressZlib(depthPayload) {
+                depthPayload = compressedDepth
+                depthFormat = DataPacketV2.depthFormatFloat32Zlib
+                isCompressed = true
+            }
+
+            if !confidencePayload.isEmpty, let compressedConfidence = compressZlib(confidencePayload) {
+                confidencePayload = compressedConfidence
+                confidenceFormat = DataPacketV2.confidenceFormatU8Zlib
+                isCompressed = true
+            }
+        }
+
         var data = Data()
         data.append(contentsOf: DataPacketV2.magicBytes)
         data.appendUInt8(2) // version
 
         var flags: UInt8 = 0
-        if !depthBytes.isEmpty {
-            flags |= 1 << 0
+        if !depthPayload.isEmpty {
+            flags |= DataPacketV2.flagHasDepth
         }
-        if !confidenceBytes.isEmpty {
-            flags |= 1 << 1
+        if !confidencePayload.isEmpty {
+            flags |= DataPacketV2.flagHasConfidence
         }
         if isSmoothedDepth {
-            flags |= 1 << 2
+            flags |= DataPacketV2.flagSmoothedDepth
+        }
+        if isCompressed {
+            flags |= DataPacketV2.flagCompressed
+        }
+        if isDepthClipped {
+            flags |= DataPacketV2.flagDepthClipped
+        }
+        if isDepthDownsampled {
+            flags |= DataPacketV2.flagDepthDownsampled
+        }
+        if isConfidenceFiltered {
+            flags |= DataPacketV2.flagConfidenceFiltered
         }
         data.appendUInt8(flags)
         data.appendUInt16LE(0) // reserved
@@ -148,13 +225,17 @@ class DataPacketV2 {
         data.appendUInt32LE(depthWidth)
         data.appendUInt32LE(depthHeight)
 
-        data.appendUInt8(DataPacketV2.depthFormatFloat32)
-        data.appendUInt8(confidenceBytes.isEmpty ? 0 : DataPacketV2.confidenceFormatU8)
-        data.appendUInt32LE(UInt32(depthBytes.count))
-        data.appendUInt32LE(UInt32(confidenceBytes.count))
+        data.appendUInt8(depthFormat)
+        data.appendUInt8(confidenceFormat)
+        data.appendUInt8(depthDownsampleFactor)
+        data.appendUInt8(minConfidenceLevel)
+        data.appendUInt16LE(0) // reserved2
+        data.appendFloat32LE(depthClipMaxMeters)
+        data.appendUInt32LE(UInt32(depthPayload.count))
+        data.appendUInt32LE(UInt32(confidencePayload.count))
 
-        data.append(depthBytes)
-        data.append(confidenceBytes)
+        data.append(depthPayload)
+        data.append(confidencePayload)
         return data
     }
 }
