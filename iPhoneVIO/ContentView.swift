@@ -10,6 +10,7 @@ import RealityKit
 
 struct ContentView : View {
     @ObservedObject var viewController: ViewController = ViewController()
+    @ObservedObject var dataRecorder: DataRecorder
     @State private var newHostIP: String = "192.168.123.18"
     @State private var newHostPort: String = "5555"
 
@@ -38,9 +39,9 @@ struct ContentView : View {
                         .background(Color.black.opacity(0.5))
                         .cornerRadius(16)
                     }
-                    
-                    Button{
-                        ARManager.shared.actionStream.send(.update(ip: newHostIP, port: Int(newHostPort)!))
+                    HStack(spacing: 20) {
+                        Button {
+                            ARManager.shared.actionStream.send(.update(ip: newHostIP, port: Int(newHostPort)!))
                         } label: {
                             Image(systemName: "arrow.clockwise")
                                 .resizable()
@@ -50,6 +51,20 @@ struct ContentView : View {
                                 .background(.regularMaterial)
                                 .cornerRadius(16)
                         }
+                        
+                        Button {
+                            viewController.toggleRecording()
+                        } label: {
+                            Image(systemName: dataRecorder.isRecording ? "stop.circle.fill" : "record.circle")
+                                .resizable()
+                                .scaledToFit()
+                                .frame(width: 30, height: 30)
+                                .foregroundColor(dataRecorder.isRecording ? .red : .primary)
+                                .padding()
+                                .background(.regularMaterial)
+                                .cornerRadius(16)
+                        }
+                    }
                 }.padding()
             }
     }
@@ -70,5 +85,6 @@ struct ARViewContainer: UIViewControllerRepresentable {
 
 
 #Preview {
-    ContentView()
+    let vc = ViewController()
+    ContentView(viewController: vc, dataRecorder: vc.dataRecorder)
 }

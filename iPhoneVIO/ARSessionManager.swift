@@ -15,6 +15,7 @@ class ViewController: UIViewController, ARSessionDelegate, ObservableObject {
 
     let session = ARSession()
     let socketClient = SocketClient()
+    let dataRecorder = DataRecorder()
     var hostIP: String = "192.168.123.18"
 
     var hostPort: Int = 5555
@@ -102,8 +103,10 @@ class ViewController: UIViewController, ARSessionDelegate, ObservableObject {
         let fps: Double = dt > 0 ? 1.0 / dt : 0.0
         let streamMode = depthStreamingEnabled ? (usingSmoothedDepth ? "depth_smooth" : "depth_raw") : "pose_only"
 
-        displayString = "x: \(String(format: "%.4f", transform[3][0])), y: \(String(format: "%.4f", transform[3][1])), z: \(String(format: "%.4f", transform[3][2])), fps: \(String(format: "%.3f", fps)), mode: \(streamMode)"
+        displayString = "x: \(String(format: "%.4f", transform[3][0])), y: \(String(format: "%.4f", transform[3][1])), z: \(String(format: "%.4f", transform[3][2])), fps: \(String(format: "%.3f", fps)), mode: \(streamMode)\nRec: \(dataRecorder.getIsRecording())"
         prevTimestamp = timestamp
+        
+        // 1. Online Streaming (Zmq / SocketIO)
         if publishPose {
             if depthStreamingEnabled, let depthPacket = makeDepthPacket(frame: frame, transform: transform, poseTimestamp: timestamp) {
                 socketClient.sendDataV2(depthPacket)
@@ -112,6 +115,46 @@ class ViewController: UIViewController, ARSessionDelegate, ObservableObject {
                 socketClient.sendData(dataPacket)
             }
         }
+        
+        // 2. Offline Recording
+        if dataRecorder.getIsRecording() {
+            let uptime = ProcessInfo.processInfo.systemUptime
+            let timeSinceNow = timestamp - uptime
+            let absoluteTimestamp = Date().timeIntervalSince1970 + timeSinceNow
+            
+            var rawDepth16: Data? = nil
+            if let depthData = usingSmoothedDepth ? frame.smoothedSceneDepth : frame.sceneDepth {
+                rawDepth16 = extractFloat16Depth(depthMap: depthData.depthMap)
+            }
+            
+            dataRecorder.record(frame: frame, epochTimeSeconds: absoluteTimestamp, depthPayloadFloat16: rawDepth16)
+        }
+    }
+    
+    private func extractFloat16Depth(depthMap: CVPixelBuffer) -> Data? {
+        CVPixelBufferLockBaseAddress(depthMap, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
+        let width = CVPixelBufferGetWidth(depthMap)
+        let height = CVPixelBufferGetHeight(depthMap)
+        guard width > 0, height > 0 else { return nil }
+        
+        let depthBytesPerRow = CVPixelBufferGetBytesPerRow(depthMap)
+        guard let depthBaseAddress = CVPixelBufferGetBaseAddress(depthMap) else { return nil }
+        
+        var depthOutput = Data(capacity: width * height * MemoryLayout<Float16>.size)
+        for y in 0..<height {
+            let rowP = depthBaseAddress.advanced(by: y * depthBytesPerRow).assumingMemoryBound(to: Float32.self)
+            for x in 0..<width {
+                // UMI uses meters? Yes, but UMI-FT expects unclipped float16
+                // Invalid depth is usually NaN, substitute with 0.
+                let val32 = rowP[x]
+                var val16 = (!val32.isFinite || val32 <= 0) ? Float16(0) : Float16(val32)
+                Swift.withUnsafeBytes(of: &val16) { bytes in
+                    depthOutput.append(bytes.bindMemory(to: UInt8.self))
+                }
+            }
+        }
+        return depthOutput
     }
 
     private func makeDepthPacket(frame: ARFrame, transform: simd_float4x4, poseTimestamp: Double) -> DataPacketV2? {
@@ -261,6 +304,24 @@ class ViewController: UIViewController, ARSessionDelegate, ObservableObject {
     
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
+        if dataRecorder.getIsRecording() {
+            dataRecorder.stopRecording()
+        }
         session.pause()
+    }
+    
+    func toggleRecording() {
+        if dataRecorder.getIsRecording() {
+            dataRecorder.stopRecording()
+        } else {
+            // Wait, ARFrame.camera.imageResolution tells us the proper size.
+            // But we don't have frame here. Defaulting to 1920x1080 for wide camera in iOS.
+            // Best is to use session.currentFrame?.camera.imageResolution.
+            if let resolution = session.currentFrame?.camera.imageResolution {
+                dataRecorder.startRecording(cameraResolution: resolution)
+            } else {
+                dataRecorder.startRecording(cameraResolution: CGSize(width: 1920, height: 1080))
+            }
+        }
     }
 }

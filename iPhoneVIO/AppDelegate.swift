@@ -16,8 +16,12 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
 
+        // Write a test file to verify Documents / file sharing works
+        DataRecorder.writeTestFileToDocuments()
+        
         // Create the SwiftUI view that provides the window contents.
-        let contentView = ContentView()
+        let viewController = ViewController()
+        let contentView = ContentView(viewController: viewController, dataRecorder: viewController.dataRecorder)
 
         // Use a UIHostingController as window root view controller.
         let window = UIWindow(frame: UIScreen.main.bounds)
